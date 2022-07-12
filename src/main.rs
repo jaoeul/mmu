@@ -50,7 +50,10 @@ struct Swap {
 impl Swap {
     /// Create a swapfile on disk.
     pub fn new(nb_pages: usize) -> Swap {
-        File::create(SWAP_FILENAME).unwrap();
+
+        let file = File::create(SWAP_FILENAME).unwrap();
+        file.set_len((nb_pages * PAGE_SIZE).try_into().unwrap());
+
         let file = File::options()
             .read(true)
             .write(true)
@@ -100,7 +103,7 @@ impl Mmu {
 }
 
 fn main() {
-    println!("Hello, world!");
-    let mmu = Mmu::new(NB_FRAMES, NB_SWAP_PAGES);
+    let mut mmu = Mmu::new(NB_FRAMES, NB_SWAP_PAGES);
+    mmu.swap.pages.push({[0u8; PAGE_SIZE]});
     println!("{:#?}", mmu);
 }
