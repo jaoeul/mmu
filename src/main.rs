@@ -27,7 +27,7 @@ const MAP_ANONYMOUS: usize = 0x20;
 
 /// Swap constants.
 const SWAP_FILENAME: &str = "mmu.swap";
-const NB_SWAP_PAGES: usize = 20;
+const NB_SWAP_PAGES: usize = 3;
 
 /// Layout of the page table levels. Needs to add up to 64.
 const PAGE_TABLE_LAYOUT: [usize; 6] = [19, 9, 9, 9, 9, 9];
@@ -58,6 +58,15 @@ const PAGE_TABLE_ENTRY_EMPTY: u32 = 0xdeadc0de;
 /// as a page offset into swap, and the last 9 bits are used as a byte offset
 /// into the page where the target byte is allocated.
 const PAGE_TABLE_ENTRY_ON_DISK: u32 = 1 << (PAGE_TABLE_ENTRY_SIZE * 8 - 1);
+
+/// Frame index offset of the root page table in host memory.
+const PAGE_TABLE_ROOT: u32 = 0;
+
+enum PTError {
+    UninitializedPage,
+    Miss,
+    InvalidAddress,
+}
 
 /// Return number of binary `1`s equal to `n`. Compile time evaluable.
 const fn binary_ones(n: usize) -> usize {
@@ -144,117 +153,127 @@ impl PageTable {
     }
 }
 
-#[derive(Clone, Debug)]
-struct FrameMeta {
-    is_free: bool,
-    is_page_table: bool,
-    parent_page: PageTableEntry,
-}
-
-impl FrameMeta {
-    fn new() -> FrameMeta {
-        FrameMeta {
-            is_free: true,
-            is_page_table: false,
-            parent_page: PAGE_TABLE_ENTRY_EMPTY,
+impl From<Page> for PageTable {
+    fn from(page: Page) -> PageTable {
+        let mut pt = PageTable::new();
+        let mut i = 0;
+        while i < PAGE_SIZE {
+            pt.entries[i] = u32::from_le_bytes(page[i..i + 3].try_into().unwrap());
+            i += 4;
         }
-    }
-
-    fn clear(&mut self) {
-        self.is_free = true;
-        self.is_page_table = false;
-        self.parent_page = PAGE_TABLE_ENTRY_EMPTY;
+        return pt;
     }
 }
 
-/// Tracks allocated and free frames in memory.
-#[derive(Debug)]
-struct FrameAllocator {
-    busy_frames: VecDeque<usize>,
-    free_frames: Vec<usize>,
-    frames: Vec<Page>,
-    meta: Vec<FrameMeta>,
-    swap: Swap,
+impl From<&Page> for PageTable {
+    fn from(page: &Page) -> PageTable {
+        let mut pt = PageTable::new();
+        let mut i = 0;
+        while i < PAGE_SIZE {
+            pt.entries[i] = u32::from_le_bytes(page[i..i + 3].try_into().unwrap());
+            i += 4;
+        }
+        return pt;
+    }
 }
 
-impl FrameAllocator {
-    fn new(nb_pages: usize) -> FrameAllocator {
-        // Make sure that the highest page table offset a virtual address can
-        // have fits in our page tables.
-        for i in 0..PAGE_TABLE_LAYOUT.len() {
-            if PAGE_TABLE_LAYOUT_UNUSED_INDICIES.contains(&i) {
-                continue;
-            }
-            let curr_off = binary_ones(PAGE_TABLE_LAYOUT[i]);
-            if curr_off > NB_PAGE_TABLE_ENTRIES {
-            panic!("Virtual address offset range exceeds the number of entries \
-                   a page table can have. Chosen range: 0-{}, Page table fits: \
-                   {}. Chose a vadr layout with less bits per page table \
-                   offset, i.e. a smaller range.",
-                   curr_off, NB_PAGE_TABLE_ENTRIES);
-            }
+/*
+impl<'a> From<Page> for &'a PageTable {
+    fn from(page: Page) -> &'a PageTable {
+        let pt = &PageTable::new();
+        let mut i = 0;
+        while i < PAGE_SIZE {
+            pt.entries[i] = u32::from_le_bytes(page[i..i + 3].try_into().unwrap());
+            i += 4;
         }
-        FrameAllocator {
-            busy_frames: VecDeque::new(),
-            free_frames: (0..nb_pages).collect(),
-            frames: vec![[0u8; PAGE_SIZE]; nb_pages],
-            meta: vec![FrameMeta::new(); NB_FRAMES],
-            swap: Swap::new(NB_SWAP_PAGES),
+        return &pt;
+    }
+}
+*/
+
+/// PageTableWalker always have a shorter lifespan then the page tables and
+/// frames it acts upon. Only looks, does not touch.
+struct PageTableWalker<'a> {
+    level: usize,
+    offset: usize,
+    vadr: usize,
+    page: &'a Page,
+    prev_page: Option<&'a Page>,
+    frames: &'a mut Vec<Page>,
+}
+
+impl<'a> PageTableWalker<'a> {
+    fn new(root_pt: &'a mut Page, frames: &'a mut Vec<Page>, vadr: usize)
+            -> PageTableWalker<'a> {
+        PageTableWalker {
+            level: 0,
+            offset: 0,
+            vadr: vadr,
+            page: root_pt,
+            prev_page: None,
+            frames: frames,
         }
     }
 
-    /// Copies the contents of a frame to swap and adds it to the `free_frames`
-    /// vector. This is where one can implement different page eviction
-    /// algorithms, would one feel like it. Currently use a first-come-first-go
-    /// approach to page eviction. Returns the index of the frame which got
-    /// freed up by the evicton.
-    fn evict_frame(&mut self) -> usize {
-        let evictee = self.busy_frames.pop_front().unwrap();
-        let mut new_home = self.swap.put_page(self.frames[evictee]);
-        // Mark new address with a swap bit, indicating it's location on diska
-        // swap.
-        new_home |= PAGE_TABLE_ENTRY_ON_DISK as usize;
-        println!("Evictee: {:#?}", evictee);
-        println!("New home: {:#?}", new_home &
-                 !PAGE_TABLE_ENTRY_ON_DISK as usize);
-        // Break the tough news...
-        let parent = self.meta[evictee].parent_page;
-        // No references to the evicted page means that the evictee was located
-        // in the root page table. If there is one, we update it with the new
-        // page location on swap.
-        if parent != PAGE_TABLE_ENTRY_EMPTY {
-            let mut parent_page = if parent & PAGE_TABLE_ENTRY_ON_DISK != 0 {
-                let parent_off = parent & !PAGE_TABLE_ENTRY_ON_DISK;
-                    &self.swap.pages[parent_off as usize]
-                }
-                else {
-                    &self.frames[parent as usize]
-                };
-            let parent_page_pt: &mut PageTable = unsafe {
-                &mut transmute::<Page, PageTable>(*parent_page)
-            };
-            // Update parent's information.
-            parent_page_pt.entries[self.meta[evictee].parent_page as usize] =
-                new_home as u32;
-        }
-        // Clear the evicted frame.
-        for byte in self.frames[evictee].iter_mut() {
-            *byte = 0;
-        }
-        self.meta[evictee].clear();
-        self.free_frames.push(evictee);
-        return evictee;
+    fn mask_offset(&self) -> usize {
+        //let shift: usize = PAGE_TABLE_LAYOUT[self.curr_level..PAGE_TABLE_DEPTH].iter().sum();
+        //return  off = (vadr >> shift) & binary_ones(
+            //PAGE_TABLE_LAYOUT[self.curr_level]);
+        return 0;
     }
 
-    /// Returns the index off the allocated frame in the `frames` vector.
-    fn alloc(&mut self) -> usize {
-        let allocated = if self.free_frames.len() == 0 {
-            self.evict_frame()
+    // Returns true if the target address is pointing to disk.
+    fn on_disk(&self, entry: u32) -> bool {
+        return entry & PAGE_TABLE_ENTRY_ON_DISK != 0;
+    }
+
+    fn next_level<'b>(&'b mut self, frames: &mut Vec<Page>) -> Result<(), PTError>
+    where
+        'b: 'a,
+    {
+
+        let offset = self.mask_offset();
+        let pt = PageTable::from(self.page);
+        let entry = pt.entries[offset];
+
+        // Is the target entry empty?
+        if entry == 0 {
+            // Need to allocate a new slot here.
+            return Err(PTError::UninitializedPage);
+        }
+
+        // Is the target entry on disk or not?
+        if self.on_disk(entry) {
+            //self.curr_pt = transmute::<Page, PageTable>(swap.pages[*entry]);
+            // Should return error indicating swapped page.
+            return Err(PTError::Miss);
         }
         else {
-            self.free_frames.pop().unwrap()
-        };
-        return allocated;
+            self.prev_page = Some(self.page);
+            self.page = &frames[entry as usize];
+            Ok(())
+        }
+    }
+
+    // TODO: Next up:
+    fn update(&mut self, entry: u32) {
+        /*
+        let pt = PageTable::from(self.prev_page);
+        self.prev_page.unwrap().entries[self.offset] = entry;
+        */
+    }
+
+    // Walk until `curr_pt` points to the target page.
+    fn walk(&mut self, frames: &mut Vec<Page>) {
+        for i in 0..PAGE_TABLE_LAYOUT.len() {
+            for j in 0..PAGE_TABLE_LAYOUT_UNUSED_INDICIES.len() {
+                if PAGE_TABLE_LAYOUT[i] == PAGE_TABLE_LAYOUT_UNUSED_INDICIES[j]
+                {
+                    continue;
+                }
+            }
+            self.next_level(frames);
+        }
     }
 }
 
@@ -313,29 +332,54 @@ impl Drop for Swap {
 
 #[derive(Debug)]
 struct Mmu {
-    frame_allocator: FrameAllocator,
+    frames: Vec<Page>,
+    busy_frames: VecDeque<usize>,
+    free_frames: Vec<usize>,
     root_pt: PageTable,
+    swap: Swap,
 }
 
 impl Mmu {
     pub fn new(nb_frames: usize, nb_swap_pages: usize) -> Mmu {
+
+        for i in 0..PAGE_TABLE_LAYOUT.len() {
+            if PAGE_TABLE_LAYOUT_UNUSED_INDICIES.contains(&i) {
+                continue;
+            }
+            let curr_off = binary_ones(PAGE_TABLE_LAYOUT[i]);
+            if curr_off > NB_PAGE_TABLE_ENTRIES {
+            panic!("Virtual address offset range exceeds the number of entries \
+                   a page table can have. Chosen range: 0-{}, Page table fits: \
+                   {}. Chose a vadr layout with less bits per page table \
+                   offset, i.e. a smaller range, or increase page size.",
+                   curr_off, NB_PAGE_TABLE_ENTRIES);
+            }
+        }
+
         Mmu {
-            frame_allocator: FrameAllocator::new(nb_frames),
+            frames: vec![[0; PAGE_SIZE]; nb_frames],
+            busy_frames: VecDeque::new(),
+            free_frames: (0..nb_frames).collect(),
             root_pt: PageTable::new(),
+            swap: Swap::new(NB_SWAP_PAGES),
         }
     }
 
+    /*
     /// Return byte of the virtual address. Could be at disk, or in host memory.
     /// We don't know.
     pub fn lookup(&mut self, vadr: usize) -> u8 {
         // We need to get the correct offset into the page table entry for every
         // level.
         let mut curr_pt = &mut self.root_pt;
-        let mut prev_entry = PAGE_TABLE_ENTRY_EMPTY;
+        let mut curr_entry = PAGE_TABLE_ROOT;
         let mut prev_offset = PAGE_TABLE_ENTRY_EMPTY;
         // Traverse all page tables, until we reach the final level of acutal
         // memory mapped pages.
         for i in 0..PAGE_TABLE_DEPTH {
+
+            println!("level: {}", i);
+
             // Ignore current level?
             if PAGE_TABLE_LAYOUT_UNUSED_INDICIES.contains(&i) {
                 continue;
@@ -346,40 +390,69 @@ impl Mmu {
                 .sum();
             let off = (vadr >> shift) & binary_ones(PAGE_TABLE_LAYOUT[i]);
             println!("i: {}, shift: {}, offset: {}", i, shift, off);
+
             // Empty page table entry?
             if curr_pt.entries[off] == PAGE_TABLE_ENTRY_EMPTY {
-                let new_frame = self.frame_allocator.alloc();
-                self.frame_allocator.busy_frames.push_back(new_frame);
-                self.frame_allocator.meta[new_frame].parent_page = prev_entry;
+                let new_frame = self.alloc();
+
+                self.busy_frames.push_back(new_frame);
+                self.meta[new_frame].parent_page =
+                    curr_entry as u32;
+                self.meta[new_frame].is_page_table = true;
+
+                // Note the address of the new page table in its parent page.
+                let mut parent_page = if curr_entry & PAGE_TABLE_ENTRY_ON_DISK != 0 {
+                    // If parent page table is on disk.
+                    let parent_pt_swap = curr_entry & !PAGE_TABLE_ENTRY_ON_DISK;
+                        &mut self.swap.pages[parent_pt_swap
+                            as usize]
+                    }
+                    // If parent page table is in host memory.
+                    else {
+                        &mut self.frames[curr_entry as usize]
+                    };
+                let mut parent_pt = unsafe {
+                    &mut transmute::<&mut Page, &mut PageTable>(parent_page)
+                };
+                parent_pt.entries[off] = new_frame as u32;
+
                 // Create a new page table at the new frame.
-                self.frame_allocator.frames[new_frame] =
+                self.frames[new_frame] =
                     unsafe { transmute::<PageTable, Page>(PageTable::new()) };
                 // Note the address of the new page table.
                 curr_pt.entries[off] = new_frame as u32;
-                println!("Created new page table at frame: {}, level: {}",
-                         new_frame, i);
+                println!("Created new page table at frame: {}, entry offset: \
+                         {}, level: {}, parent page: {}",
+                         off, new_frame, i, curr_entry);
             }
+
             // Continue the traversal.
             let pt_entry = curr_pt.entries[off];
-            // Get the next page table either swap disk or from host memory.
+
+            // Get the next page table from either swap or host memory.
             let next_pt_frame = if pt_entry & PAGE_TABLE_ENTRY_ON_DISK != 0 {
+
+                // Clear the swap indication bit.
                 let pt_entry_swap = pt_entry & !PAGE_TABLE_ENTRY_ON_DISK;
-                    &self.frame_allocator.swap.pages[pt_entry_swap as usize]
+                    &self.swap.pages[pt_entry_swap as usize]
                 }
                 else {
-                    &self.frame_allocator.frames[pt_entry as usize]
+                    &self.frames[pt_entry as usize]
                 };
+
             let next_pt = unsafe {
                 transmute::<Page, PageTable>(*next_pt_frame)
             };
             *curr_pt = next_pt;
-            prev_entry = pt_entry;
+            curr_entry = pt_entry;
             prev_offset = off as u32;
         }
+
         // Final level reached. Time to find the actual byte.
         let byte_offset = vadr & binary_ones(
             PAGE_TABLE_LAYOUT[PAGE_TABLE_DEPTH]);
         println!("Last offset: {}", byte_offset);
+
         // Convert the the last level is not a page table, but a table of actual
         // page.
         let target_page: Page = unsafe {
@@ -388,6 +461,72 @@ impl Mmu {
         //return self.frame_allocator.frames[last_off] as usize;
         return target_byte.into();
     }
+    */
+
+    fn lookup(&mut self, vadr: usize) -> u8 {
+        return 0;
+    }
+
+    /*
+    /// Copies the contents of a frame to swap and adds it to the `free_frames`
+    /// vector. This is where one can implement different page eviction
+    /// algorithms, would one feel like it. Currently use a first-come-first-go
+    /// approach to page eviction. Returns the index of the frame which got
+    /// freed up by the evicton.
+    fn evict_frame(&mut self) -> usize {
+        let evictee = self.busy_frames.pop_front().unwrap();
+        let mut new_home = self.swap.put_page(self.frames[evictee]);
+        // Mark new address with a swap bit, indicating it's location on diska
+        // swap.
+        new_home |= PAGE_TABLE_ENTRY_ON_DISK as usize;
+        println!("Evictee: {:#?}", evictee);
+        println!("New home: {:#?}", new_home &
+                 !PAGE_TABLE_ENTRY_ON_DISK as usize);
+
+        // Break the tough news...
+        let parent = self.meta[evictee].parent_page;
+
+        // No references to the evicted page means that the evictee was located
+        // in the root page table. If there is one, we update it with the new
+        // page location on swap.
+        if parent != PAGE_TABLE_ENTRY_EMPTY {
+            let mut parent_page = if parent & PAGE_TABLE_ENTRY_ON_DISK != 0 {
+                let parent_off = parent & !PAGE_TABLE_ENTRY_ON_DISK;
+                    &self.swap.pages[parent_off as usize]
+                }
+                else {
+                    &self.frames[parent as usize]
+                };
+            let parent_page_pt: &mut PageTable = unsafe {
+                &mut transmute::<Page, PageTable>(*parent_page)
+            };
+            // Update parent's information.
+            parent_page_pt.entries[self.meta[evictee].parent_page as usize] =
+                new_home as u32;
+        }
+        // Clear the evicted frame.
+        for byte in self.frames[evictee].iter_mut() {
+            *byte = 0;
+        }
+        self.meta[evictee].clear();
+        self.free_frames.push(evictee);
+        return evictee;
+    }
+    */
+    fn evict_frame(&mut self) -> usize {
+        return 0;
+    }
+
+    /// Returns the index off the allocated frame in the `frames` vector.
+    fn alloc(&mut self) -> usize {
+        let allocated = if self.free_frames.len() == 0 {
+            self.evict_frame()
+        }
+        else {
+            self.free_frames.pop().unwrap()
+        };
+        return allocated;
+    }
 }
 
 fn main() {
@@ -395,6 +534,9 @@ fn main() {
     //const PAGE_TABLE_LAYOUT: [usize; 6] = [19, 9, 9, 9, 9, 9];
     let num: usize = 0b1111111111111111111_000000001_000000001_000000001_000000001_000000001;
     let ret = mmu.lookup(num);
+
+    println!("{:#x?}", mmu);
+
     let num: usize = 0b1111111111111111111_000000011_000000001_000000001_000000001_000000001;
     let ret = mmu.lookup(num);
     println!("{:#x}", NB_FRAMES);
