@@ -1,5 +1,5 @@
 extern crate syscalls;
-use core::mem::{ManuallyDrop, transmute, size_of};
+use core::mem::{ManuallyDrop, size_of};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
@@ -57,15 +57,24 @@ const PAGE_TABLE_ENTRY_EMPTY: u32 = 0xdeadc0de;
 /// of the entry is used to indicate this, the lower 22 bits are used to
 /// as a page offset into swap, and the last 9 bits are used as a byte offset
 /// into the page where the target byte is allocated.
-const PAGE_TABLE_ENTRY_ON_DISK: u32 = 1 << (PAGE_TABLE_ENTRY_SIZE * 8 - 1);
+const PAGE_TABLE_ENTRY_ON_DISK: usize = 1 << (PAGE_TABLE_ENTRY_SIZE * 8 - 1);
 
 /// Frame index offset of the root page table in host memory.
 const PAGE_TABLE_ROOT: u32 = 0;
+
+/// Number of entries in the translation lookaside buffer.
+const NB_TLB_ENTRIES: usize = 16;
 
 enum PTError {
     UninitializedPage,
     Miss,
     InvalidAddress,
+}
+
+enum TLBLookupResult {
+    Hit,
+    TLBMiss,
+    Disk,
 }
 
 /// Return number of binary `1`s equal to `n`. Compile time evaluable.
@@ -137,6 +146,48 @@ const fn binary_ones(n: usize) -> usize {
         63 => { return 0b0111111111111111111111111111111111111111111111111111111111111111; },
         64 => { return 0b1111111111111111111111111111111111111111111111111111111111111111; },
         _ => { panic!("64 is my limit!"); },
+    }
+}
+
+fn mask_offset(vadr: usize, level: usize) -> usize {
+    // If we are at the last level, there is no need to shift.
+    if level == PAGE_TABLE_DEPTH {
+        return vadr & binary_ones(PAGE_TABLE_LAYOUT[level]);
+    }
+    let shift: usize = PAGE_TABLE_LAYOUT[level + 1..PAGE_TABLE_DEPTH].iter()
+        .sum();
+    return (vadr >> shift) & binary_ones(PAGE_TABLE_LAYOUT[level]);
+}
+
+#[derive(Clone, Debug)]
+struct TLBEntry {
+    // Virtual page number.
+    vpn: usize,
+
+    // Physical page number.
+    ppn: usize,
+}
+
+impl TLBEntry {
+    fn new(vpn: usize, ppn: usize) -> TLBEntry {
+        TLBEntry {
+            vpn: vpn,
+            ppn: ppn,
+        }
+    }
+}
+
+struct TLBResult {
+    res: TLBLookupResult,
+    adr: usize,
+}
+
+impl TLBResult {
+    fn new(res: TLBLookupResult, adr: usize) -> TLBResult {
+        TLBResult {
+            res: res,
+            adr: adr,
+        }
     }
 }
 
@@ -215,24 +266,21 @@ impl<'a> PageTableWalker<'a> {
         }
     }
 
-    fn mask_offset(&self) -> usize {
-        //let shift: usize = PAGE_TABLE_LAYOUT[self.curr_level..PAGE_TABLE_DEPTH].iter().sum();
-        //return  off = (vadr >> shift) & binary_ones(
-            //PAGE_TABLE_LAYOUT[self.curr_level]);
-        return 0;
+    fn update(&mut self, entry: u32) {
+        /*
+        let pt = PageTable::from(self.prev_page);
+        self.prev_page.unwrap().entries[self.offset] = entry;
+        */
     }
 
-    // Returns true if the target address is pointing to disk.
-    fn on_disk(&self, entry: u32) -> bool {
-        return entry & PAGE_TABLE_ENTRY_ON_DISK != 0;
-    }
-
-    fn next_level<'b>(&'b mut self, frames: &mut Vec<Page>) -> Result<(), PTError>
+    /*
+    /// Check if the next level page is reachable, and if it is, return the
+    /// its addresses offset into the current page table.
+    fn next_level<'b>(&'b mut self) -> Result<(), PTError>
     where
-        'b: 'a,
+    'b: 'a,
     {
-
-        let offset = self.mask_offset();
+        let offset = mask_offset(self.vadr);
         let pt = PageTable::from(self.page);
         let entry = pt.entries[offset];
 
@@ -242,38 +290,52 @@ impl<'a> PageTableWalker<'a> {
             return Err(PTError::UninitializedPage);
         }
 
-        // Is the target entry on disk or not?
-        if self.on_disk(entry) {
-            //self.curr_pt = transmute::<Page, PageTable>(swap.pages[*entry]);
-            // Should return error indicating swapped page.
-            return Err(PTError::Miss);
-        }
-        else {
-            self.prev_page = Some(self.page);
-            self.page = &frames[entry as usize];
-            Ok(())
-        }
+        self.prev_page = Some(self.page);
+        self.page = &self.frames[entry as usize];
+        Ok(())
     }
+    */
 
-    // TODO: Next up:
-    fn update(&mut self, entry: u32) {
-        /*
-        let pt = PageTable::from(self.prev_page);
-        self.prev_page.unwrap().entries[self.offset] = entry;
-        */
-    }
+    /// Walk the page tables until we find the guest physical page. On
+    /// encountering a entry for a page which is not yet allocated, return None.
+    fn walk<'b>(&'b self) -> Option<Page>
+    where
+    'b: 'a,
+    {
+        let vadr = self.vadr;
+        let mut curr_page = self.page.clone();
+        let mut prev_page: Option<Page> = None;
 
-    // Walk until `curr_pt` points to the target page.
-    fn walk(&mut self, frames: &mut Vec<Page>) {
         for i in 0..PAGE_TABLE_LAYOUT.len() {
+
+            // Skip this level if it is not used for page table indexing.
+            let mut ignore = false;
             for j in 0..PAGE_TABLE_LAYOUT_UNUSED_INDICIES.len() {
                 if PAGE_TABLE_LAYOUT[i] == PAGE_TABLE_LAYOUT_UNUSED_INDICIES[j]
                 {
-                    continue;
+                    ignore = true;
                 }
             }
-            self.next_level(frames);
+            if ignore {
+                break;
+            };
+
+            let offset = mask_offset(vadr, i);
+            let pt = PageTable::from(curr_page);
+            let entry = pt.entries[offset];
+
+            println!("offset: {}, entry: {}", offset, entry);
+
+            // Is the target entry empty?
+            if entry == 0 {
+                // Need to allocate a new slot here.
+                return None;
+            }
+
+            prev_page = Some(curr_page).clone();
+            curr_page = self.frames[entry as usize];
         }
+        return Some(curr_page);
     }
 }
 
@@ -333,10 +395,13 @@ impl Drop for Swap {
 #[derive(Debug)]
 struct Mmu {
     frames: Vec<Page>,
+    tlb: Vec<TLBEntry>,
     busy_frames: VecDeque<usize>,
     free_frames: Vec<usize>,
-    root_pt: PageTable,
+    root_pt: Page,
     swap: Swap,
+    tlb_misses: u64,
+    page_faults: u64,
 }
 
 impl Mmu {
@@ -358,10 +423,13 @@ impl Mmu {
 
         Mmu {
             frames: vec![[0; PAGE_SIZE]; nb_frames],
+            tlb: vec![TLBEntry::new(0, 0); NB_TLB_ENTRIES],
             busy_frames: VecDeque::new(),
             free_frames: (0..nb_frames).collect(),
-            root_pt: PageTable::new(),
+            root_pt: [0; PAGE_SIZE],
             swap: Swap::new(NB_SWAP_PAGES),
+            tlb_misses: 0,
+            page_faults: 0,
         }
     }
 
@@ -463,7 +531,38 @@ impl Mmu {
     }
     */
 
-    fn lookup(&mut self, vadr: usize) -> u8 {
+    /// Get the page offset for a address. Applicable for both virtual and
+    /// physical addresses.
+    //fn ppn_offset(&self, adr: usize) -> usize {
+        //return adr & binary_ones(PAGE_TABLE_LAYOUT);
+    //}
+
+    /// Physical page number lookup. Find the physical page corresponding to a
+    /// virtual address.
+    ///
+    /// High level algorithm:
+    /// - Check TLB.
+    /// - If hit, return found.
+    /// - Else miss, walk page table.
+    /// - Check if page is on disk.
+    /// - If page is on disk, increment page fault counter and return found.
+    /// - Else page is in guest physical memory, return found.
+    fn ppn_lookup(&mut self, vadr: usize) -> usize {
+
+        let tlb_res = self.tlb_lookup(vadr);
+
+        // TLB hit!
+        if tlb_res.is_some() {
+            return tlb_res.unwrap();
+        }
+
+        // Let's take a page walk.
+        self.tlb_misses += 1;
+
+        let pt_walker = PageTableWalker::new(&mut self.root_pt,
+                                             &mut self.frames, vadr);
+        pt_walker.walk();
+
         return 0;
     }
 
@@ -527,18 +626,50 @@ impl Mmu {
         };
         return allocated;
     }
+
+    /// Returns true if the target address is pointing to disk.
+    fn on_disk(&self, entry: usize) -> bool {
+        return entry & PAGE_TABLE_ENTRY_ON_DISK != 0;
+    }
+
+    /// Get the virtual page number from a virtual address.
+    fn vadr_to_vpn(&self, vadr: usize) -> usize {
+        // The lowest 9 bits are used as virtual page offset (VPO).
+        return vadr >> 9;
+    }
+
+    /// Returns the a page address from the TLB if present, otherwise return
+    /// None.
+    fn tlb_lookup(&self, vadr: usize) -> Option<usize> {
+
+        let vpn = self.vadr_to_vpn(vadr);
+
+        for i in 0..self.tlb.len() {
+            if vpn == self.tlb[i].vpn {
+                // Hit!
+                return Some(self.tlb[i].ppn);
+            }
+        }
+        // Page fault.
+        return None;
+    }
+
+    /// Update a entry in the TLB with `vadr`.
+    fn tlb_set_page(&self, vadr: u32) {
+    }
+
 }
 
 fn main() {
     let mut mmu = Mmu::new(NB_FRAMES, NB_SWAP_PAGES);
     //const PAGE_TABLE_LAYOUT: [usize; 6] = [19, 9, 9, 9, 9, 9];
     let num: usize = 0b1111111111111111111_000000001_000000001_000000001_000000001_000000001;
-    let ret = mmu.lookup(num);
+    let ret = mmu.ppn_lookup(num);
 
     println!("{:#x?}", mmu);
 
     let num: usize = 0b1111111111111111111_000000011_000000001_000000001_000000001_000000001;
-    let ret = mmu.lookup(num);
+    let ret = mmu.ppn_lookup(num);
     println!("{:#x}", NB_FRAMES);
     println!("{:#x}", ret);
 }
